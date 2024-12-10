@@ -19,17 +19,117 @@ from aomaker.hook_manager import cli_hook, session_hook
 from aomaker.models import ExecuteAsyncJobCondition
 
 
-def dependence(dependent_api: Callable or str, var_name: Text, imp_module=None, *out_args, **out_kwargs):
+# def dependence(dependent_api: Callable or str, var_name: Text, imp_module=None, *out_args, **out_kwargs):
+#     """
+#     接口依赖调用装饰器，
+#     会在目标接口调用前，先去调用其前置依赖接口，然后存储依赖接口的完整响应结果到cache表中，key为var_name
+#     若var_name已存在，将不会再调用该依赖接口
+#
+#     :param dependent_api: 接口依赖，直接传入接口对象；若依赖接口是同一个类下的方法，需要传入字符串：类名.方法名
+#     :param var_name: 依赖的参数名
+#     :param imp_module: 若依赖接口是同一个类下的方法，需要导入模块
+#     :param out_args: 依赖接口需要的参数
+#     :param out_kwargs: 依赖接口需要的参数
+#     :return:
+#     """
+#
+#     def decorator(func):
+#         @wraps(func)
+#         def wrapper(*args, **kwargs):
+#             api_name = func.__name__
+#             if not cache.get(var_name):
+#                 dependence_res, depend_api_info = _call_dependence(dependent_api, api_name, imp_module=imp_module,
+#                                                                    *out_args, **out_kwargs)
+#                 depend_api_name = depend_api_info.get("name")
+#                 cache.set(var_name, dependence_res, api_info=depend_api_info)
+#
+#                 logger.info(f"==========存储全局变量{var_name}完成==========")
+#                 logger.info(f"==========<{api_name}>前置依赖<{depend_api_name}>结束==========")
+#             else:
+#                 logger.info(
+#                     f"==========<{api_name}>前置依赖已被调用过，本次不再调用,依赖参数{var_name}直接从cache表中读取==========")
+#             r = func(*args, **kwargs)
+#             return r
+#
+#         return wrapper
+#
+#     return decorator
+# --coding:utf-8--
+import os
+import importlib
+from typing import List, Dict, Callable, Text, Tuple, Union, Optional
+from functools import wraps
+from dataclasses import dataclass as dc, field
+
+import yaml
+import click
+from jsonpath import jsonpath
+from genson import SchemaBuilder
+
+from aomaker.cache import cache
+from aomaker.log import logger
+from aomaker.path import BASEDIR
+from aomaker.exceptions import FileNotFound, YamlKeyError, JsonPathExtractFailed, CompareException
+from aomaker.hook_manager import cli_hook, session_hook
+from aomaker.models import ExecuteAsyncJobCondition
+
+
+# def dependence(dependent_api: Callable or str, var_name: Text, imp_module=None, *out_args, **out_kwargs):
+#     """
+#     接口依赖调用装饰器，
+#     会在目标接口调用前，先去调用其前置依赖接口，然后存储依赖接口的完整响应结果到cache表中，key为var_name
+#     若var_name已存在，将不会再调用该依赖接口
+#
+#     :param dependent_api: 接口依赖，直接传入接口对象；若依赖接口是同一个类下的方法，需要传入字符串：类名.方法名
+#     :param var_name: 依赖的参数名
+#     :param imp_module: 若依赖接口是同一个类下的方法，需要导入模块
+#     :param out_args: 依赖接口需要的参数
+#     :param out_kwargs: 依赖接口需要的参数
+#     :return:
+#     """
+#
+#     def decorator(func):
+#         @wraps(func)
+#         def wrapper(*args, **kwargs):
+#             api_name = func.__name__
+#             if not cache.get(var_name):
+#                 dependence_res, depend_api_info = _call_dependence(dependent_api, api_name, imp_module=imp_module,
+#                                                                    *out_args, **out_kwargs)
+#                 depend_api_name = depend_api_info.get("name")
+#                 cache.set(var_name, dependence_res, api_info=depend_api_info)
+#
+#                 logger.info(f"==========存储全局变量{var_name}完成==========")
+#                 logger.info(f"==========<{api_name}>前置依赖<{depend_api_name}>结束==========")
+#             else:
+#                 logger.info(
+#                     f"==========<{api_name}>前置依赖已被调用过，本次不再调用,依赖参数{var_name}直接从cache表中读取==========")
+#             r = func(*args, **kwargs)
+#             return r
+#
+#         return wrapper
+#
+#     return decorator
+
+def get_value_by_jsonpath(jsonpath_expr, datasource):
+    if ':' in jsonpath_expr:
+        json_path, index = jsonpath_expr.split(':')
+    else:
+        index = 0
+    extract_var = jsonpath(datasource, jsonpath_expr)
+    if extract_var is False:
+        raise JsonPathExtractFailed(datasource, jsonpath_expr)
+    return extract_var[index]
+
+
+def dependence(dependent_api: Callable or str, var_name: Text, require: bool = False, refresh: bool = False, *out_args):
     """
     接口依赖调用装饰器，
     会在目标接口调用前，先去调用其前置依赖接口，然后存储依赖接口的完整响应结果到cache表中，key为var_name
     若var_name已存在，将不会再调用该依赖接口
-
-    :param dependent_api: 接口依赖，直接传入接口对象；若依赖接口是同一个类下的方法，需要传入字符串：类名.方法名
+    :param dependent_api: 接口依赖，直接传入接口对象；若依赖接口是同一个类下的方法，需要传入字符串：类下实例化的对象.方法名
     :param var_name: 依赖的参数名
-    :param imp_module: 若依赖接口是同一个类下的方法，需要导入模块
-    :param out_args: 依赖接口需要的参数
-    :param out_kwargs: 依赖接口需要的参数
+    :param require: 请求是否需要参数传入
+    :param refresh: 此依赖是否每次请求都需要刷新，默认为否
     :return:
     """
 
@@ -37,17 +137,22 @@ def dependence(dependent_api: Callable or str, var_name: Text, imp_module=None, 
         @wraps(func)
         def wrapper(*args, **kwargs):
             api_name = func.__name__
-            if not cache.get(var_name):
-                dependence_res, depend_api_info = _call_dependence(dependent_api, api_name, imp_module=imp_module,
-                                                                   *out_args, **out_kwargs)
+            imp_module = func.__module__
+            try:
+                dependent_param = kwargs['dependence'][var_name] if require else dict()
+            except KeyError:
+                logger.info(f"==========<{api_name}>前置依赖{var_name}方法未传入依赖参数跳过执行==========")
+                r = func(*args, **kwargs)
+                return r
+            if not cache.get(var_name) or refresh:
+                dependence_res, depend_api_info = _call_dependence(dependent_api, api_name, imp_module,
+                                                                   *out_args, **dependent_param)
                 depend_api_name = depend_api_info.get("name")
-                cache.set(var_name, dependence_res, api_info=depend_api_info)
-
-                logger.info(f"==========存储全局变量{var_name}完成==========")
                 logger.info(f"==========<{api_name}>前置依赖<{depend_api_name}>结束==========")
             else:
                 logger.info(
                     f"==========<{api_name}>前置依赖已被调用过，本次不再调用,依赖参数{var_name}直接从cache表中读取==========")
+
             r = func(*args, **kwargs)
             return r
 
@@ -55,7 +160,41 @@ def dependence(dependent_api: Callable or str, var_name: Text, imp_module=None, 
 
     return decorator
 
+def be_dependence(var_name: Text, condition: Union[Dict, bool], jsonpath_expr: str = ""):
+    """
+    标明此接口被其他接口所依赖，会将其响应结果存储，key为var_name
+    :param var_name:存储响应结果使用的key
+    :param jsonpath_expr: jsonpath用于查找响应结果的某字段,未传入则存储整段响应
+    :param condition: 通过`:`分割后用jsonpath查找到的结果判断是否此条件，为True时才会存入cache表，未传入默认均存入
+    :return:
+    """
 
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            resp = func(*args, **kwargs)
+            is_execute = _is_execute_cycle_func(resp, condition=condition)
+            api_name = func.__name__
+            if is_execute:
+                logger.info(f"==========<{api_name}>被指定为依赖接口,将响应结果存储为全局变量==========")
+                api_info = {
+                    "name": api_name,
+                    "module": _get_module_name_by_method_obj(func),
+                    "ao": eval(f'args[0].{api_name}.__self__.__name__')  # 类方法首个位置参数始终为类实例
+                }
+                if jsonpath_expr:
+                    cache.update(var_name, get_value_by_jsonpath(jsonpath_expr, resp)) if cache.get(var_name) else cache.set(var_name, get_value_by_jsonpath(jsonpath_expr, resp), api_info=api_info)
+                else:
+                    cache.update(var_name, resp) if cache.get(var_name) else cache.set(var_name, resp, api_info=api_info)
+                logger.info(f"==========<{api_name}>存储全局变量{var_name}完成==========")
+            else:
+                logger.info(
+                    f"==========<{api_name}>已被调用，但响应结果不满足传入条件,不对{var_name}进行存储==========")
+            return resp
+
+        return wrapper
+
+    return decorator
 def async_api(cycle_func: Callable, jsonpath_expr: Union[Text, List], expr_index=0, condition: Union[Dict, bool] = None,
               *out_args,
               **out_kwargs):
